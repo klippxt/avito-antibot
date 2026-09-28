@@ -234,10 +234,30 @@ def event_type_shares(events: pd.DataFrame) -> pd.DataFrame:
     return shares.add_prefix("share_")
 
 
-def build_features(events: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
+def item_popularity(window_events: pd.DataFrame) -> pd.Series:
+    views = window_events.dropna(subset=["item_id"])
+    first_views = (
+        views.groupby(["item_id", "cookie_id"])
+        .agg(first_view=("event_ts", "min"), window_end=("window_end_ts", "first"))
+        .reset_index()
+    )
+    other_views = first_views[["item_id", "cookie_id", "first_view"]].rename(
+        columns={"cookie_id": "other_cookie", "first_view": "other_first_view"}
+    )
+    pairs = first_views.merge(other_views, on="item_id")
+    is_other = pairs["other_cookie"] != pairs["cookie_id"]
+    is_earlier = pairs["other_first_view"] < pairs["window_end"]
+    viewers = pairs[is_other & is_earlier].groupby(["cookie_id", "item_id"]).size()
+    viewers = viewers.rename("other_viewers").reset_index()
+    first_views = first_views.merge(viewers, on=["cookie_id", "item_id"], how="left")
+    first_views["other_viewers"] = first_views["other_viewers"].fillna(0)
+    return first_views.groupby("cookie_id")["other_viewers"].mean().rename("item_popularity")
+
+
+def build_features(events: pd.DataFrame, meta: pd.DataFrame, popularity: pd.Series) -> pd.DataFrame:
     events = add_event_columns(keep_window_events(events, meta))
     features = add_ratio_features(aggregate_events(events))
-    features = features.join(event_type_shares(events))
+    features = features.join(event_type_shares(events)).join(popularity)
     assert set(meta["cookie_id"]) <= set(features.index)
     return features.loc[meta["cookie_id"]]
 
@@ -310,8 +330,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     train, test, events = load_data()
     events = clean_events(events)
-    train_x = build_features(events, train)
-    test_x = build_features(events, test)
+    all_windows = keep_window_events(events, pd.concat([train, test]))
+    popularity = item_popularity(all_windows)
+    train_x = build_features(events, train, popularity)
+    test_x = build_features(events, test, popularity)
     set_common_categories(train_x, test_x)
     target = train["target"].to_numpy()
 
